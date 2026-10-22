@@ -1,1 +1,4 @@
-# Default R8 rules are enough for this app.
+-dontwarn com.google.re2j.**
+-dontwarn org.jspecify.annotations.**
+-dontwarn javax.annotation.**
+-dontwarn okhttp3.internal.platform.**

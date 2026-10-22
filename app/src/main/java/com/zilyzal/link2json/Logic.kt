@@ -1,33 +1,51 @@
 package com.zilyzal.link2json
 
-import java.net.HttpURLConnection
-import java.net.URL
 import java.net.URLDecoder
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 
 data class ParseResult(val valid: List<String>, val invalid: Int)
 
 data class Probe(val size: Long?, val mime: String?)
 
+data class Found(val url: String, val file: String)
+
 data class PartInfo(val url: String, val file: String, val size: Long? = null, val mime: String? = null)
+
+/** One batch of files that belong together (e.g. all parts of one release on one host). */
+data class LinkGroup(val id: String, val title: String, val host: String, val parts: List<PartInfo>)
+
+data class Analysis(
+    val title: String?,
+    val image: String?,
+    val source: String?,
+    val groups: List<LinkGroup>,
+    val notes: List<String>,
+)
 
 data class JsonDoc(val text: String, val fileName: String)
 
 object LinkParser {
+    private const val ARCH = """(?:rar|zip|7z|tar|gz|bz2|xz|iso|r\d{2}|z\d{2})"""
+
     private val splitter = Regex("""[\s,;]+""")
     private val schemeRegex = Regex("""^[a-zA-Z][a-zA-Z0-9+.-]*://\S+$""")
     private val bareRegex = Regex("""^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:[:/?#]\S*)?$""")
-    private val partSuffix = Regex("""(?i)[._-]?(part|pt)[._-]?\d+(\.[a-z0-9]{1,5})?$""")
+
+    private val archiveToken = Regex("""(?i)[^\s"'<>|\\/]+\.$ARCH(?:\.\d{3})?(?:\.html?)?(?![A-Za-z0-9])""")
+    private val wholeArchiveName = Regex("""(?i)^[^<>|\\/]{1,150}\.$ARCH(?:\.\d{3})?(?:\.html?)?$""")
+
+    private val htmlSuffix = Regex("""(?i)\.html?$""")
     private val numericSuffix = Regex("""\.\d{3}$""")
+    private val archiveExt = Regex("""(?i)\.$ARCH$""")
+    private val partSuffix = Regex("""(?i)[._\s-]?(part|pt)[._\s-]?\d+(\.[a-z0-9]{1,5})?$""")
     private val extSuffix = Regex("""\.[A-Za-z][A-Za-z0-9]{0,4}$""")
+
+    private val directExts = setOf(
+        "rar", "zip", "7z", "tar", "gz", "bz2", "xz", "iso", "exe", "msi", "apk", "bin", "dmg", "pkg",
+        "cab", "img", "deb", "mp4", "mkv", "avi", "mp3", "flac", "pdf", "epub", "torrent",
+    )
 
     fun parse(text: String): ParseResult {
         val seen = LinkedHashSet<String>()
@@ -45,14 +63,22 @@ object LinkParser {
         return ParseResult(seen.toList(), invalid)
     }
 
-    fun arrange(valid: List<String>, multi: Boolean, sort: Boolean): List<String> {
-        if (!multi) return valid.take(1)
-        if (!sort) return valid
-        val cmp = Comparator<String> { a, b ->
-            val byFile = compareNatural(fileNameOf(a).ifEmpty { a }, fileNameOf(b).ifEmpty { b })
-            if (byFile != 0) byFile else compareNatural(a, b)
-        }
-        return valid.sortedWith(cmp)
+    fun isArchiveName(s: String): Boolean = archiveToken.containsMatchIn(s)
+
+    /** Pulls a file name like "Game.part1.rar" out of link text, or null when there is none. */
+    fun fileFromText(text: String): String? {
+        val t = text.trim()
+        if (t.isEmpty()) return null
+        if (wholeArchiveName.matches(t)) return t
+        return archiveToken.find(t)?.value
+    }
+
+    /** True when the link itself points at a file; false when it looks like a web page to scan. */
+    fun isDirect(url: String): Boolean {
+        val name = fileNameOf(url)
+        if (name.isEmpty()) return false
+        if (isArchiveName(name)) return true
+        return name.substringAfterLast('.', "").lowercase() in directExts
     }
 
     private fun afterScheme(url: String): String {
@@ -61,6 +87,16 @@ object LinkParser {
     }
 
     fun hostOf(url: String): String = afterScheme(url).substringBefore('/').substringBefore('?')
+
+    /** Host without port and subdomains, so dl1.host.com and dl2.host.com count as one host. */
+    fun hostKey(host: String): String {
+        val labels = host.substringBefore(':').lowercase().split('.').filter { it.isNotEmpty() }
+        if (labels.size <= 2) return labels.joinToString(".")
+        val last = labels[labels.size - 1]
+        val prev = labels[labels.size - 2]
+        val take = if (last.length == 2 && prev.length <= 3) 3 else 2
+        return labels.takeLast(take).joinToString(".")
+    }
 
     fun fileNameOf(url: String): String {
         val path = afterScheme(url).substringBefore('?').substringAfter('/', "")
@@ -73,12 +109,36 @@ object LinkParser {
     }
 
     fun deriveName(file: String): String {
-        var n = file
-        n = n.replace(partSuffix, "")
+        var n = file.trim()
+        n = n.replace(htmlSuffix, "")
         n = n.replace(numericSuffix, "")
+        n = n.replace(archiveExt, "")
+        n = n.replace(partSuffix, "")
         n = n.replace(extSuffix, "")
         n = n.trim()
         return n.ifEmpty { "untitled" }
+    }
+
+    /** Groups files by host and release name, keeping page order for groups and natural order inside. */
+    fun group(items: List<Found>): List<LinkGroup> {
+        val parts = LinkedHashMap<String, MutableList<PartInfo>>()
+        val titles = HashMap<String, String>()
+        val hosts = HashMap<String, String>()
+        for (f in items) {
+            val base = deriveName(f.file)
+            val host = hostKey(hostOf(f.url))
+            val key = host + "|" + base.lowercase()
+            parts.getOrPut(key) { mutableListOf() }.add(PartInfo(f.url, f.file))
+            titles.putIfAbsent(key, base)
+            hosts.putIfAbsent(key, host)
+        }
+        return parts.map { (key, list) ->
+            val sorted = list.sortedWith { a, b ->
+                val c = compareNatural(a.file, b.file)
+                if (c != 0) c else compareNatural(a.url, b.url)
+            }
+            LinkGroup(key, titles[key] ?: "untitled", hosts[key] ?: "", sorted)
+        }
     }
 
     fun compareNatural(a: String, b: String): Int {
@@ -111,31 +171,51 @@ object LinkParser {
 }
 
 object JsonBuilder {
-    fun build(nameInput: String, parts: List<PartInfo>): JsonDoc {
-        val name = nameInput.trim().ifEmpty { LinkParser.deriveName(parts.first().file) }
-        val sizes = parts.mapNotNull { it.size }
-        val total = if (sizes.size == parts.size) sizes.sum() else null
+    fun build(nameInput: String, meta: Analysis?, groups: List<LinkGroup>): JsonDoc {
+        val name = nameInput.trim().ifEmpty {
+            meta?.title?.takeIf { it.isNotBlank() } ?: groups.first().title
+        }
+        val all = groups.flatMap { it.parts }
+        val sizes = all.mapNotNull { it.size }
+        val total = if (sizes.size == all.size) sizes.sum() else null
         val created = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(
             OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS)
         )
 
-        val sb = StringBuilder(256 + parts.size * 180)
+        val sb = StringBuilder(512 + all.size * 200)
         sb.append("{\n")
         sb.append("  \"name\": ").append(quote(name)).append(",\n")
-        sb.append("  \"type\": ").append(quote(if (parts.size > 1) "multipart" else "single")).append(",\n")
-        sb.append("  \"parts\": ").append(parts.size).append(",\n")
-        if (total != null) sb.append("  \"totalSize\": ").append(total).append(",\n")
+        meta?.image?.let { sb.append("  \"image\": ").append(quote(it)).append(",\n") }
+        meta?.source?.let { sb.append("  \"source\": ").append(quote(it)).append(",\n") }
         sb.append("  \"created\": ").append(quote(created)).append(",\n")
-        sb.append("  \"links\": [\n")
-        parts.forEachIndexed { i, p ->
+        sb.append("  \"totalParts\": ").append(all.size).append(",\n")
+        if (total != null) sb.append("  \"totalSize\": ").append(total).append(",\n")
+        sb.append("  \"packages\": [\n")
+        groups.forEachIndexed { gi, g ->
+            val gSizes = g.parts.mapNotNull { it.size }
             sb.append("    {\n")
-            sb.append("      \"part\": ").append(i + 1).append(",\n")
-            sb.append("      \"file\": ").append(quote(p.file)).append(",\n")
-            sb.append("      \"url\": ").append(quote(p.url))
-            if (p.size != null) sb.append(",\n      \"size\": ").append(p.size)
-            if (p.mime != null) sb.append(",\n      \"mime\": ").append(quote(p.mime))
-            sb.append("\n    }")
-            if (i < parts.lastIndex) sb.append(',')
+            sb.append("      \"name\": ").append(quote(g.title)).append(",\n")
+            sb.append("      \"host\": ").append(quote(g.host)).append(",\n")
+            sb.append("      \"type\": ").append(quote(if (g.parts.size > 1) "multipart" else "single")).append(",\n")
+            sb.append("      \"parts\": ").append(g.parts.size).append(",\n")
+            if (gSizes.size == g.parts.size) {
+                sb.append("      \"totalSize\": ").append(gSizes.sum()).append(",\n")
+            }
+            sb.append("      \"links\": [\n")
+            g.parts.forEachIndexed { i, p ->
+                sb.append("        {\n")
+                sb.append("          \"part\": ").append(i + 1).append(",\n")
+                sb.append("          \"file\": ").append(quote(p.file)).append(",\n")
+                sb.append("          \"url\": ").append(quote(p.url))
+                if (p.size != null) sb.append(",\n          \"size\": ").append(p.size)
+                if (p.mime != null) sb.append(",\n          \"mime\": ").append(quote(p.mime))
+                sb.append("\n        }")
+                if (i < g.parts.lastIndex) sb.append(',')
+                sb.append('\n')
+            }
+            sb.append("      ]\n")
+            sb.append("    }")
+            if (gi < groups.lastIndex) sb.append(',')
             sb.append('\n')
         }
         sb.append("  ]\n}\n")
@@ -144,7 +224,7 @@ object JsonBuilder {
             .trim()
             .replace(Regex("""\s+"""), "_")
             .take(60)
-            .ifEmpty { "links" }
+            .ifEmpty { "package" }
         return JsonDoc(sb.toString(), "$safe.json")
     }
 
@@ -163,78 +243,5 @@ object JsonBuilder {
         }
         sb.append('"')
         return sb.toString()
-    }
-}
-
-object LinkChecker {
-    suspend fun check(urls: List<String>): List<Probe> = coroutineScope {
-        val gate = Semaphore(4)
-        urls.map { u -> async(Dispatchers.IO) { gate.withPermit { probe(u) } } }.awaitAll()
-    }
-
-    private fun request(startUrl: String, method: String, range: Boolean): HttpURLConnection? {
-        var current = startUrl
-        repeat(6) {
-            val c = (URL(current).openConnection() as HttpURLConnection).apply {
-                requestMethod = method
-                connectTimeout = 8000
-                readTimeout = 8000
-                instanceFollowRedirects = false
-                setRequestProperty("User-Agent", "Mozilla/5.0 (Android) Link2JSON")
-                setRequestProperty("Accept-Encoding", "identity")
-                if (range) setRequestProperty("Range", "bytes=0-0")
-            }
-            val code = c.responseCode
-            if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
-                val loc = c.getHeaderField("Location")
-                c.disconnect()
-                if (loc.isNullOrBlank()) return null
-                current = URL(URL(current), loc).toString()
-            } else {
-                return c
-            }
-        }
-        return null
-    }
-
-    private fun mimeOf(c: HttpURLConnection): String? =
-        c.contentType?.substringBefore(';')?.trim()?.takeIf { it.isNotEmpty() }
-
-    private fun probe(url: String): Probe {
-        var size: Long? = null
-        var mime: String? = null
-        try {
-            val head = request(url, "HEAD", false)
-            if (head != null) {
-                try {
-                    if (head.responseCode in 200..299) {
-                        size = head.contentLengthLong.takeIf { it >= 0 }
-                        mime = mimeOf(head)
-                    }
-                } finally {
-                    head.disconnect()
-                }
-            }
-            if (size == null) {
-                val get = request(url, "GET", true)
-                if (get != null) {
-                    try {
-                        val code = get.responseCode
-                        if (code == 206) {
-                            size = get.getHeaderField("Content-Range")
-                                ?.substringAfterLast('/')?.trim()?.toLongOrNull()
-                        } else if (code in 200..299) {
-                            size = get.contentLengthLong.takeIf { it >= 0 }
-                        }
-                        if (mime == null && code in 200..299) mime = mimeOf(get)
-                    } finally {
-                        get.disconnect()
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            // Unreachable or unsupported link: leave size/mime empty.
-        }
-        return Probe(size, mime)
     }
 }
