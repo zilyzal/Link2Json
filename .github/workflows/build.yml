@@ -1,0 +1,65 @@
+name: Build & Release APK
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-35" "build-tools;35.0.0" > /dev/null
+
+      - name: Build release APK
+        shell: bash
+        run: ./gradlew --no-daemon --stacktrace :app:assembleRelease 2>&1 | tee build.log
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          cp app/build/outputs/apk/release/app-release.apk Link2JSON.apk
+          if gh release view "v$VER" > /dev/null 2>&1; then
+            gh release upload "v$VER" Link2JSON.apk --clobber
+          else
+            gh release create "v$VER" Link2JSON.apk \
+              --title "Link2JSON v$VER" \
+              --notes "Install **Link2JSON.apk** on Android 8.0+ (allow installs from your browser or file manager)." \
+              --target "$GITHUB_SHA"
+          fi
+
+      - name: Publish build log on failure
+        if: failure()
+        shell: bash
+        run: |
+          tail -n 400 build.log > /tmp/build-log.txt || echo "no build log" > /tmp/build-log.txt
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git checkout --orphan build-log
+          git rm -rf . > /dev/null 2>&1 || true
+          cp /tmp/build-log.txt build-log.txt
+          git add build-log.txt
+          git commit -m "Build log for $GITHUB_SHA"
+          git push -f origin build-log
